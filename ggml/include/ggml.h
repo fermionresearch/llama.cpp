@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_FV5     = 43, // Fermion five-value ternary {0, +/-s_lo, +/-s_hi}: dual f32 scales + 3 bit-planes per 256-block
+        GGML_TYPE_FV5B    = 44, // Fermion int8 companion: f32 row scale + 256 int8 per block (TRTC v4 embed/lm_head records)
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision

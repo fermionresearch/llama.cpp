@@ -409,6 +409,20 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_FV5] = {
+        // no from_float: FV5 tensors are produced offline (TRTC v4 -> GGUF)
+        // vec_dot_type F32: activations are used raw (no runtime quantization),
+        // keeping llama.cpp numerics in the same class as the f32 expansion
+        // reference the Fermion correctness gate compares against.
+        .vec_dot                  = ggml_vec_dot_fv5_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_FV5B] = {
+        .vec_dot                  = ggml_vec_dot_fv5b_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },

@@ -562,6 +562,139 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+// ====================== Fermion five-value ternary (FV5 / FV5B)
+//
+// vec_dot against RAW F32 activations (vec_dot_type == GGML_TYPE_F32): the
+// activations are never quantized, so the only difference vs a full f32
+// matmul with the expanded weights is summation order. Weights per block:
+//   w[j] = (bp[j] - bn[j]) * (br[j] ? s_hi : s_lo)
+// so the block dot factors into four masked activation sums:
+//   dot = s_lo * (sum_lo_p - sum_lo_n) + s_hi * (sum_hi_p - sum_hi_n)
+// This mirrors the sign/masked-accumulate structure of the reference NEON
+// decode (kernels/neon_war5_lab.c) in portable form.
+
+#if defined(__AVX2__)
+static inline float ggml_fv5_hsum_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x55));
+    return _mm_cvtss_f32(lo);
+}
+#endif
+
+void ggml_vec_dot_fv5_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_FV5 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_fv5 * GGML_RESTRICT x = vx;
+    const float     * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_FV5;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float s_lo = x[i].s_lo;
+        const float s_hi = x[i].s_hi;
+        const float * GGML_RESTRICT xf = y + i*QK_FV5;
+
+#if defined(__AVX2__)
+        const __m256i bitpos = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+        __m256 acc_lo_p = _mm256_setzero_ps();
+        __m256 acc_lo_n = _mm256_setzero_ps();
+        __m256 acc_hi_p = _mm256_setzero_ps();
+        __m256 acc_hi_n = _mm256_setzero_ps();
+
+        for (int j = 0; j < QK_FV5/8; ++j) {
+            const uint8_t bpj = x[i].bp[j];
+            const uint8_t bnj = x[i].bn[j];
+            if (!(bpj | bnj)) {
+                continue;
+            }
+            const __m256i m_p = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(bpj), bitpos), bitpos);
+            const __m256i m_n = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(bnj), bitpos), bitpos);
+            const __m256i m_r = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(x[i].br[j]), bitpos), bitpos);
+
+            const __m256 x8 = _mm256_loadu_ps(xf + 8*j);
+
+            acc_lo_p = _mm256_add_ps(acc_lo_p, _mm256_and_ps(x8, _mm256_castsi256_ps(_mm256_andnot_si256(m_r, m_p))));
+            acc_lo_n = _mm256_add_ps(acc_lo_n, _mm256_and_ps(x8, _mm256_castsi256_ps(_mm256_andnot_si256(m_r, m_n))));
+            acc_hi_p = _mm256_add_ps(acc_hi_p, _mm256_and_ps(x8, _mm256_castsi256_ps(_mm256_and_si256(m_p, m_r))));
+            acc_hi_n = _mm256_add_ps(acc_hi_n, _mm256_and_ps(x8, _mm256_castsi256_ps(_mm256_and_si256(m_n, m_r))));
+        }
+
+        sumf += s_lo * (ggml_fv5_hsum_ps(acc_lo_p) - ggml_fv5_hsum_ps(acc_lo_n))
+              + s_hi * (ggml_fv5_hsum_ps(acc_hi_p) - ggml_fv5_hsum_ps(acc_hi_n));
+#else
+        float sum_lo_p = 0.0f, sum_lo_n = 0.0f, sum_hi_p = 0.0f, sum_hi_n = 0.0f;
+
+        for (int j = 0; j < QK_FV5/8; ++j) {
+            const uint8_t bpj = x[i].bp[j];
+            const uint8_t bnj = x[i].bn[j];
+            if (!(bpj | bnj)) {
+                continue;
+            }
+            const uint8_t brj = x[i].br[j];
+            const float * GGML_RESTRICT xj = xf + 8*j;
+            for (int b = 0; b < 8; ++b) {
+                const uint8_t bit = 1u << b;
+                if (bpj & bit) {
+                    if (brj & bit) { sum_hi_p += xj[b]; } else { sum_lo_p += xj[b]; }
+                } else if (bnj & bit) {
+                    if (brj & bit) { sum_hi_n += xj[b]; } else { sum_lo_n += xj[b]; }
+                }
+            }
+        }
+
+        sumf += s_lo * (sum_lo_p - sum_lo_n) + s_hi * (sum_hi_p - sum_hi_n);
+#endif
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_fv5b_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_FV5 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_fv5b * GGML_RESTRICT x = vx;
+    const float      * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_FV5;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float * GGML_RESTRICT xf = y + i*QK_FV5;
+
+#if defined(__AVX2__)
+        __m256 acc = _mm256_setzero_ps();
+        for (int j = 0; j < QK_FV5/8; ++j) {
+            const __m128i q8  = _mm_loadl_epi64((const __m128i *)(x[i].qs + 8*j));
+            const __m256  qf  = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8));
+            acc = _mm256_fmadd_ps(qf, _mm256_loadu_ps(xf + 8*j), acc);
+        }
+        sumf += x[i].s * ggml_fv5_hsum_ps(acc);
+#else
+        float sumq = 0.0f;
+        for (int j = 0; j < QK_FV5; ++j) {
+            sumq += (float) x[i].qs[j] * xf[j];
+        }
+        sumf += x[i].s * sumq;
+#endif
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

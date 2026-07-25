@@ -942,6 +942,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_FV5] = {
+        .type_name                = "fv5",
+        .blck_size                = QK_FV5,
+        .type_size                = sizeof(block_fv5),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_fv5,
+        .from_float_ref           = NULL, // produced offline by the TRTC v4 -> GGUF converter
+    },
+    [GGML_TYPE_FV5B] = {
+        .type_name                = "fv5b",
+        .blck_size                = QK_FV5,
+        .type_size                = sizeof(block_fv5b),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_fv5b,
+        .from_float_ref           = NULL, // produced offline by the TRTC v4 -> GGUF converter
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

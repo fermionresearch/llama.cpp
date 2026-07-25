@@ -287,6 +287,30 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// Fermion five-value ternary (TRTC v4 trit records): w = (bp - bn) * (br ? s_hi : s_lo)
+// Scales are exact f32 copies of the container's per-row dual scales,
+// replicated into every block of the row. Bit-planes keep the container's
+// little bit order (bit i of byte j selects element 8*j + i).
+// 3.25 bpw
+#define QK_FV5 256
+typedef struct {
+    float   s_lo;            // low-magnitude scale
+    float   s_hi;            // high-magnitude scale
+    uint8_t bp[QK_FV5/8];    // +1 plane
+    uint8_t bn[QK_FV5/8];    // -1 plane (disjoint from bp)
+    uint8_t br[QK_FV5/8];    // hi-magnitude selector (subset of bp|bn)
+} block_fv5;
+static_assert(sizeof(block_fv5) == 2 * sizeof(float) + 3 * (QK_FV5/8), "wrong fv5 block size/padding");
+
+// Fermion int8 rows (TRTC v4 embed/lm_head records): w = s * q
+// s is the exact f32 per-row scale, replicated into every block of the row.
+// 8.125 bpw
+typedef struct {
+    float  s;                // row scale
+    int8_t qs[QK_FV5];
+} block_fv5b;
+static_assert(sizeof(block_fv5b) == sizeof(float) + QK_FV5, "wrong fv5b block size/padding");
+
 //
 // Super-block quantization structures
 //

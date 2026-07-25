@@ -654,6 +654,50 @@ class TQ2_0(__Quant, qtype=GGMLQuantizationType.TQ2_0):
         return (d * qs.astype(np.float32))
 
 
+class FV5(__Quant, qtype=GGMLQuantizationType.FV5):
+    # Fermion five-value ternary. Blocks are produced offline by the
+    # TRTC v4 -> GGUF converter; float -> FV5 quantization is intentionally
+    # not implemented (per-row dual scales live in the container).
+    # Layout: f32 s_lo, f32 s_hi, bp[32], bn[32], br[32] (little bit order).
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError("FV5 is produced offline from TRTC v4 containers")
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        s_lo, s_hi, bp, bn, br = np.hsplit(blocks, [4, 8, 40, 72])
+
+        s_lo = s_lo.view(np.float32)  # (n, 1)
+        s_hi = s_hi.view(np.float32)
+
+        bp = np.unpackbits(bp, axis=-1, bitorder="little")  # (n, 256) in {0,1}
+        bn = np.unpackbits(bn, axis=-1, bitorder="little")
+        br = np.unpackbits(br, axis=-1, bitorder="little")
+
+        sign = bp.astype(np.float32) - bn.astype(np.float32)
+        mag = np.where(br != 0, s_hi, s_lo).astype(np.float32)
+        return sign * mag
+
+
+class FV5B(__Quant, qtype=GGMLQuantizationType.FV5B):
+    # Fermion int8 rows (TRTC v4 embed/lm_head records): w = f32(s) * int8 q.
+    # Layout: f32 s, int8 qs[256].
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError("FV5B is produced offline from TRTC v4 containers")
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        s, qs = np.hsplit(blocks, [4])
+
+        s = s.view(np.float32)          # (n, 1)
+        qs = qs.view(np.int8)           # (n, 256)
+
+        return s * qs.astype(np.float32)
+
+
 class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
     # e2m1 values (doubled)
     # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
