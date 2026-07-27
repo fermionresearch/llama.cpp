@@ -281,6 +281,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    if (type == GGML_TYPE_FV5 || type == GGML_TYPE_FV5B) {
+        // Fermion types have no Q8_1 vec_dot by design (raw-f32 activation
+        // policy); single-token decode uses the fused f32 GEMV in mmv-fv5.cu
+        return false;
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {

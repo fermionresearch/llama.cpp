@@ -4,7 +4,7 @@ Branch `fermion-fv5` on top of upstream `ggml-org/llama.cpp` commit
 `d67c0b4107112e4790774c3a8169e2e3eb24643b` (2026-07-25). This fork adds two
 ggml weight types so llama.cpp can LOAD AND RUN Fermion Research's TRTC v4
 five-value ternary containers (Neutrino-0.6B, Neutrino-8B) converted to GGUF.
-CPU backend only in this cut. The graph is untouched: both models are stock
+CPU and CUDA backends in this cut. The graph is untouched: both models are stock
 Qwen3 geometry (`qwen3` arch, per-head Q/K RMSNorm, biasless qkv), which
 mainline already implements.
 
@@ -63,13 +63,35 @@ for any argmax flip. KV cache is set to F32 in the gate tool.
   registration + numpy dequantize (used by the converter's bitwise
   cross-check); float→FV5 quantize deliberately raises.
 - `tools/fermion-greedy/` — the correctness-gate tool (exact token-id
-  prompts, free + teacher-forced greedy, per-flip logit margins, F32 KV).
+  prompts, free + teacher-forced greedy, per-flip logit margins, F32 KV;
+  `-ngl N` selects GPU offload, default 0 = the certified CPU reference).
+
+## CUDA backend
+
+Numerics policy is the same as the CPU cut — stay in the f32 class, only
+summation order may differ from the f32 container expansion:
+
+- `ggml/src/ggml-cuda/dequantize.cuh` — `dequantize_fv5{,b}` block primitives
+  (exact f32 reconstruction, container bit order).
+- `ggml/src/ggml-cuda/convert.cu` — `dequantize_row_fv5{,b}_cuda` wired into
+  the `to_fp32/to_fp16/to_bf16` tables.
+- `ggml/src/ggml-cuda/mmv-fv5.cu` — fused F32-activation GEMV for single-token
+  decode (`ne11 == 1`): masked f32 activation sums per bit-plane byte, scaled
+  once per row by the exact f32 dual scales; activations are never quantized
+  (no Q8_1), mirroring the CPU `vec_dot_type = F32` policy.
+- Batched matmuls (prompt processing) dequantize to exact f32 and run true
+  f32 cuBLAS GEMM; for FV5/FV5B the compute type is pinned to f32 and TF32 is
+  disabled for the call, so prefill stays in the f32 numerics class too.
+- `getrows.cu` + `supports_op`: FV5/FV5B mul_mat and get_rows are claimed by
+  the CUDA backend; full offload (`-ngl 99`) is supported end to end.
 
 ## Deliberate non-goals of this cut
 
 - No `llama-quantize` path (conversion is offline from TRTC v4 containers).
-- No CUDA/Metal/Vulkan kernels: those backends report the types unsupported
+- No Metal/Vulkan kernels yet: those backends report the types unsupported
   and fall back to CPU. (Native GPU serving lives in the Fermion runtime.)
+- No MMQ/MMVQ (Q8_1-quantized activations) integration — deliberate: the
+  FV5 correctness contract is raw-f32 activations.
 - No repack/IMatrix/LoRA integration; training-path ops (`add`, `acc`,
   `out_prod`) on FV5 tensors abort as unsupported — inference never hits them.
 

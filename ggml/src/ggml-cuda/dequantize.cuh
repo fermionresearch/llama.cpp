@@ -430,3 +430,50 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
 }
+
+//================================== Fermion five-value ternary (FV5 / FV5B)
+//
+// Same reconstruction semantics as the CPU reference (ggml-quants.c):
+//   FV5:  w[j] = (bp[j] - bn[j]) * (br[j] ? s_hi : s_lo)   (all f32)
+//   FV5B: w[j] = s * qs[j]                                 (f32 scale, int8 q)
+// One call dequantizes one 256-element block with 32 threads: thread `tid`
+// handles plane byte `tid`, i.e. elements 8*tid .. 8*tid+7 (little bit order,
+// bit i of byte j selects element 8*j + i — container bit order preserved).
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_fv5(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_fv5 * x = (const block_fv5 *) vx;
+
+    // assume 32 threads
+    const float s_lo = x[ib].s_lo;
+    const float s_hi = x[ib].s_hi;
+
+    const uint8_t bp = x[ib].bp[tid];
+    const uint8_t bn = x[ib].bn[tid];
+    const uint8_t br = x[ib].br[tid];
+
+    dst_t * y = yy + 8*tid;
+
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        const int   sign = ((bp >> b) & 1) - ((bn >> b) & 1);
+        const float mag  = ((br >> b) & 1) ? s_hi : s_lo;
+        y[b] = ggml_cuda_cast<dst_t>((float) sign * mag);
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_fv5b(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_fv5b * x = (const block_fv5b *) vx;
+
+    // assume 32 threads
+    const float s = x[ib].s;
+    const int8_t * q = x[ib].qs + 8*tid;
+
+    dst_t * y = yy + 8*tid;
+
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        y[b] = ggml_cuda_cast<dst_t>(s * (float) q[b]);
+    }
+}

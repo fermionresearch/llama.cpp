@@ -413,6 +413,37 @@ static void dequantize_row_nvfp4_cuda(
     const int nb = k / QK_NVFP4;
     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
+// ====================== Fermion five-value ternary (FV5 / FV5B)
+// One 256-element block per CUDA block, 32 threads (see dequantize.cuh).
+
+template<typename dst_t>
+static __global__ void dequantize_block_fv5(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    dequantize_fv5(vx, i, yy + i*QK_FV5, threadIdx.x);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_fv5b(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+
+    dequantize_fv5b(vx, i, yy + i*QK_FV5, threadIdx.x);
+}
+
+template<typename dst_t>
+static void dequantize_row_fv5_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_FV5 == 0);
+    const int64_t nb = k / QK_FV5;
+    dequantize_block_fv5<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_fv5b_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_FV5 == 0);
+    const int64_t nb = k / QK_FV5;
+    dequantize_block_fv5b<<<nb, 32, 0, stream>>>(vx, y);
+}
+
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
@@ -501,6 +532,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_FV5:
+            return dequantize_row_fv5_cuda;
+        case GGML_TYPE_FV5B:
+            return dequantize_row_fv5b_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
@@ -559,6 +594,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_FV5:
+            return dequantize_row_fv5_cuda;
+        case GGML_TYPE_FV5B:
+            return dequantize_row_fv5b_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -614,6 +653,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_FV5:
+            return dequantize_row_fv5_cuda;
+        case GGML_TYPE_FV5B:
+            return dequantize_row_fv5b_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

@@ -91,6 +91,7 @@ int main(int argc, char ** argv) {
     std::string out_path;
     int steps     = 128;
     int n_threads = 8;
+    int n_gpu_layers = 0;   // default: CPU path (the certified reference); -ngl 99 = full offload
 
     for (int i = 1; i < argc; ++i) {
         auto need = [&](const char * flag) -> const char * {
@@ -103,6 +104,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--out"))     { out_path     = need("--out"); }
         else if (!strcmp(argv[i], "--steps"))   { steps        = atoi(need("--steps")); }
         else if (!strcmp(argv[i], "-t"))        { n_threads    = atoi(need("-t")); }
+        else if (!strcmp(argv[i], "-ngl"))      { n_gpu_layers = atoi(need("-ngl")); }
         else { fprintf(stderr, "error: unknown arg %s\n", argv[i]); return 1; }
     }
     if (model_path.empty() || prompts_path.empty()) {
@@ -128,7 +130,7 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;
+    mparams.n_gpu_layers = n_gpu_layers;
     const double t_load0 = now_s();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (model == nullptr) {
@@ -165,8 +167,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    fprintf(out, "{\n  \"model\": \"%s\",\n  \"steps\": %d,\n  \"n_threads\": %d,\n  \"load_seconds\": %.2f,\n  \"kv_type\": \"f32\",\n  \"prompts\": [\n",
-            model_path.c_str(), steps, n_threads, t_load);
+    fprintf(out, "{\n  \"model\": \"%s\",\n  \"steps\": %d,\n  \"n_threads\": %d,\n  \"n_gpu_layers\": %d,\n  \"load_seconds\": %.2f,\n  \"kv_type\": \"f32\",\n  \"prompts\": [\n",
+            model_path.c_str(), steps, n_threads, n_gpu_layers, t_load);
 
     double total_gen_s    = 0.0;
     double total_prompt_s = 0.0;

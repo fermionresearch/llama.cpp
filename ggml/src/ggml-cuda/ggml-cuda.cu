@@ -31,6 +31,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmv-fv5.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1617,8 +1618,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 }
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Fermion FV5/FV5B numerics policy: weights are dequantized to exact f32
+    // and the GEMM runs in true f32 (TF32 disabled below), keeping the GPU
+    // path in the same numerics class as the CPU backend / the f32 container
+    // expansion — only summation order differs.
+    const bool fermion_fv5 = src0->type == GGML_TYPE_FV5 || src0->type == GGML_TYPE_FV5B;
+
     ggml_type compute_type = src0->type;
-    if (ggml_is_quantized(compute_type)) {
+    if (fermion_fv5) {
+        compute_type = GGML_TYPE_F32;
+    } else if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
@@ -1644,6 +1653,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
+    if (fermion_fv5) {
+        // pin true f32 for FV5/FV5B regardless of hardware or env override,
+        // and disable TF32 for this GEMM (the global handle default enables it)
+        compute_type = GGML_TYPE_F32;
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+    }
+
     switch (compute_type) {
         case GGML_TYPE_F32:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
@@ -1656,6 +1672,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             break;
         default:
             GGML_ABORT("fatal error");
+    }
+
+    if (fermion_fv5) {
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
     }
 }
 
@@ -1790,7 +1810,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+                             // Fermion FV5/FV5B have no MMVQ (Q8_1) path by design — raw-f32 activations only
+                             src0->type != GGML_TYPE_FV5 && src0->type != GGML_TYPE_FV5B;
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -1846,6 +1868,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ne11 == 1 && ggml_cuda_can_mul_mat_vec_fv5(src0, src1, dst)) {
+        // Fermion FV5/FV5B: fused f32-activation GEMV (see mmv-fv5.cu);
+        // batched cases fall through to the dequant + cuBLAS F32 path below.
+        ggml_cuda_mul_mat_vec_fv5(ctx, src0, src1, dst);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -4785,6 +4813,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
                 }
+                if ((a->type == GGML_TYPE_FV5 || a->type == GGML_TYPE_FV5B) && op->op == GGML_OP_MUL_MAT_ID) {
+                    return false; // Fermion types: dense mul_mat only, no MoE path wired
+                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -4825,6 +4856,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_FV5:
+                    case GGML_TYPE_FV5B:
                         return true;
                     default:
                         return false;
@@ -4858,6 +4891,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_FV5:
+                    case GGML_TYPE_FV5B:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
