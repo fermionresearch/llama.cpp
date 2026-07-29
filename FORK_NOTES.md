@@ -19,8 +19,8 @@ with the container's deployed function, not for speed.
 | `GGML_TYPE_FV5`  | 43 | 256 | 104 (f32 `s_lo`, f32 `s_hi`, `bp[32]`, `bn[32]`, `br[32]`) | 3.25 | all attention/MLP linears |
 | `GGML_TYPE_FV5B` | 44 | 256 | 260 (f32 `s`, `int8 qs[256]`) | 8.125 | token_embd / output (TRTC int8 records) |
 
-Reconstruction semantics (identical to the container spec in
-`scripts/expand_trtc_v4_to_hf.py` of the research repo):
+Reconstruction semantics (identical to the published TRTC v4
+container spec):
 
 - FV5:  `w[j] = (bp[j] - bn[j]) * (br[j] ? s_hi : s_lo)` — five values per row
   `{0, ±s_lo, ±s_hi}`; the per-row dual scales are stored as exact f32 copies
@@ -53,8 +53,7 @@ for any argmax flip. KV cache is set to F32 in the gate tool.
   invariants `bp&bn==0`, `br⊆bp|bn`).
 - `ggml/src/ggml-cpu/quants.{c,h}` — `ggml_vec_dot_fv5_f32`,
   `ggml_vec_dot_fv5b_f32`: portable scalar with an AVX2 fast path inside
-  (masked activation sums mirroring the research repo's NEON decode
-  structure); no `arch/*/quants.c` or `arch-fallback.h` churn.
+  (masked activation sums); no `arch/*/quants.c` or `arch-fallback.h` churn.
 - `ggml/src/ggml-cpu/ggml-cpu.c` — CPU traits (`vec_dot_type = F32`).
 - `ggml/src/ggml-cpu/ops.cpp` — `get_rows` cases (embedding lookup for FV5B).
 - `include/llama.h`, `src/llama-model-loader.cpp` — `LLAMA_FTYPE_MOSTLY_FV5`

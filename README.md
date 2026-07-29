@@ -138,7 +138,7 @@ path — same binary and prompts as the CUDA gate, 128 greedy steps:
 |---|---|---|---|
 | Neutrino-0.6B-base | **8/8 identical** | 0/1024 | PASS |
 | Neutrino-0.6B-base, long prompts (136/256 tok, exercises the mat-mat prefill path) | **2/2 identical** | 0/256 | PASS |
-| Neutrino-8B (vs the banked fork-CPU streams of the shipping cut, sha `1c13a343…`) | **8/8 identical** | 0/1024 | PASS |
+| Neutrino-8B (vs the fork-CPU reference streams of the published container) | **8/8 identical** | 0/1024 | PASS |
 
 The Metal 0.6B streams are also token-identical to the **banked x86 CPU
 streams from the CUDA lane's gate** (8/8 × 128) — two machines, three
