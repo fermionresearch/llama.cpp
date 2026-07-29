@@ -51,6 +51,92 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// Fermion FV5/FV5B have no float->quant path on purpose (blocks are produced
+// offline by the TRTC v4 -> GGUF converter), so tests synthesize valid blocks
+// directly from the random float data. Invariants honored: bp & bn == 0,
+// br subset of bp | bn, and per-row scales replicated into every block of the
+// row (converter invariant the backends may rely on).
+static void init_tensor_fv5(ggml_tensor * tensor, const float * data) {
+    constexpr int64_t qk = 256;
+    constexpr size_t  bsz = 2*sizeof(float) + 3*qk/8; // block_fv5
+
+    const int64_t n_per_row = tensor->ne[0];
+    const int64_t nrows     = ggml_nelements(tensor)/n_per_row;
+    const int64_t nbpr      = n_per_row/qk;
+
+    std::vector<uint8_t> buf(ggml_nbytes(tensor));
+
+    for (int64_t ir = 0; ir < nrows; ++ir) {
+        const float * rd = data + ir*n_per_row;
+
+        const float s_lo = 0.005f + 0.05f*std::fabs(rd[0]);
+        const float s_hi = 2.5f*s_lo;
+
+        for (int64_t ib = 0; ib < nbpr; ++ib) {
+            uint8_t * blk = buf.data() + (ir*nbpr + ib)*bsz;
+
+            memcpy(blk + 0, &s_lo, sizeof(float));
+            memcpy(blk + 4, &s_hi, sizeof(float));
+
+            uint8_t * bp = blk +  8;
+            uint8_t * bn = blk + 40;
+            uint8_t * br = blk + 72;
+
+            memset(bp, 0, 3*qk/8);
+
+            for (int64_t j = 0; j < qk; ++j) {
+                const float   r   = rd[ib*qk + j];
+                const uint8_t bit = 1u << (j & 7);
+                const int64_t byte = j >> 3;
+
+                if (r > 0.25f) {
+                    bp[byte] |= bit;
+                } else if (r < -0.25f) {
+                    bn[byte] |= bit;
+                } else {
+                    continue;
+                }
+                if (std::fabs(r) > 0.65f) {
+                    br[byte] |= bit;
+                }
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(tensor, buf.data(), 0, buf.size());
+}
+
+static void init_tensor_fv5b(ggml_tensor * tensor, const float * data) {
+    constexpr int64_t qk = 256;
+    constexpr size_t  bsz = sizeof(float) + qk; // block_fv5b
+
+    const int64_t n_per_row = tensor->ne[0];
+    const int64_t nrows     = ggml_nelements(tensor)/n_per_row;
+    const int64_t nbpr      = n_per_row/qk;
+
+    std::vector<uint8_t> buf(ggml_nbytes(tensor));
+
+    for (int64_t ir = 0; ir < nrows; ++ir) {
+        const float * rd = data + ir*n_per_row;
+
+        const float s = 0.005f + 0.01f*std::fabs(rd[0]);
+
+        for (int64_t ib = 0; ib < nbpr; ++ib) {
+            uint8_t * blk = buf.data() + (ir*nbpr + ib)*bsz;
+
+            memcpy(blk, &s, sizeof(float));
+
+            int8_t * qs = (int8_t *)(blk + 4);
+            for (int64_t j = 0; j < qk; ++j) {
+                const float r = std::max(-1.0f, std::min(1.0f, rd[ib*qk + j]));
+                qs[j] = (int8_t) lrintf(127.0f*r);
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(tensor, buf.data(), 0, buf.size());
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -84,6 +170,12 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
+    } else if (tensor->type == GGML_TYPE_FV5) {
+        GGML_ASSERT(tensor->ne[0] % ggml_blck_size(tensor->type) == 0);
+        init_tensor_fv5(tensor, data.data());
+    } else if (tensor->type == GGML_TYPE_FV5B) {
+        GGML_ASSERT(tensor->ne[0] % ggml_blck_size(tensor->type) == 0);
+        init_tensor_fv5b(tensor, data.data());
     } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
         GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
 
@@ -8923,6 +9015,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 #endif
+
+    // Fermion FV5/FV5B: generic small cases + the exact GEMV shapes of the
+    // Neutrino 0.6B and 8B GGUF packs (m = ne01 rows, k = ne00 reduction).
+    // n covers: 1..8 (decode + batched GEMV, every ncols_dst instantiation),
+    // 9/16 (first sizes past the batched-GEMV window), 512 (prefill/mul_mm).
+    for (ggml_type type_a : {GGML_TYPE_FV5, GGML_TYPE_FV5B}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, n, 256,  {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 67, n, 512,  {1, 1}, {1, 1})); // m not divisible by nr0*nsg
+        }
+        // batched / broadcast
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 256, {3, 2}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 256, {3, 2}, {2, 2}));
+        // MoE-style expert dispatch
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 32, 4, 256));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, true,  32, 8, 512));
+    }
+    for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 512}) {
+        // Neutrino-0.6B-base: attn q/o, k/v, ffn gate/up, ffn down
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  2048, n, 1024,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  1024, n, 2048,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  1024, n, 1024,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  3072, n, 1024,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  1024, n, 3072,  {1, 1}, {1, 1}));
+        // Neutrino-8B: attn q/o, k/v, ffn gate/up, ffn down
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  4096, n, 4096,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  1024, n, 4096,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32, 12288, n, 4096,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5, GGML_TYPE_F32,  4096, n, 12288, {1, 1}, {1, 1}));
+    }
+    // lm_head / tied embeddings (FV5B): full vocab rows, n = 1 decode step
+    // and n = 8 (speculative-verify logits at the batched-GEMV window edge)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5B, GGML_TYPE_F32, 151936, 1, 1024, {1, 1}, {1, 1})); // 0.6B
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5B, GGML_TYPE_F32, 151936, 1, 4096, {1, 1}, {1, 1})); // 8B
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5B, GGML_TYPE_F32, 151936, 8, 1024, {1, 1}, {1, 1})); // 0.6B
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5B, GGML_TYPE_F32, 151936, 8, 4096, {1, 1}, {1, 1})); // 8B
+    // token_embd get_rows (FV5B is the shipped embedding type; FV5 wired too)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_FV5,  256, 5, 4, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_FV5,  1024, 64, 8, 2, 2, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_FV5B, 256, 5, 4, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_FV5B, 1024, 151936, 8, 1, 1, false)); // 0.6B token_embd
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_FV5B, 4096, 4096, 8, 1, 1, false));   // 8B token_embd rows (vocab subsampled)
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));
