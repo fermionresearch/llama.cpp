@@ -1870,9 +1870,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ne11 == 1 && ggml_cuda_can_mul_mat_vec_fv5(src0, src1, dst)) {
-        // Fermion FV5/FV5B: fused f32-activation GEMV (see mmv-fv5.cu);
-        // batched cases fall through to the dequant + cuBLAS F32 path below.
+    if (ne11 <= MMV_FV5_MAX_BATCH_SIZE && ggml_cuda_can_mul_mat_vec_fv5(src0, src1, dst)) {
+        // Fermion FV5/FV5B: fused f32-activation GEMV, batched over up to
+        // MMV_FV5_MAX_BATCH_SIZE activation columns (see mmv-fv5.cu); larger
+        // batches fall through to the dequant + cuBLAS F32 path below.
         ggml_cuda_mul_mat_vec_fv5(ctx, src0, src1, dst);
         return;
     }

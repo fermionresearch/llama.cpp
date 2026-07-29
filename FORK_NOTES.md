@@ -75,13 +75,17 @@ summation order may differ from the f32 container expansion:
   (exact f32 reconstruction, container bit order).
 - `ggml/src/ggml-cuda/convert.cu` — `dequantize_row_fv5{,b}_cuda` wired into
   the `to_fp32/to_fp16/to_bf16` tables.
-- `ggml/src/ggml-cuda/mmv-fv5.cu` — fused F32-activation GEMV for single-token
-  decode (`ne11 == 1`): masked f32 activation sums per bit-plane byte, scaled
-  once per row by the exact f32 dual scales; activations are never quantized
-  (no Q8_1), mirroring the CPU `vec_dot_type = F32` policy.
-- Batched matmuls (prompt processing) dequantize to exact f32 and run true
-  f32 cuBLAS GEMM; for FV5/FV5B the compute type is pinned to f32 and TF32 is
-  disabled for the call, so prefill stays in the f32 numerics class too.
+- `ggml/src/ggml-cuda/mmv-fv5.cu` — fused F32-activation GEMV for decode and
+  small batches (`ne11 <= 8`, templated on the number of activation columns
+  like mmvf/mmvq, covering the speculative-verify window): masked f32
+  activation sums per bit-plane byte (bit-plane bytes are read once per block
+  and reused for every column), scaled once per row by the exact f32 dual
+  scales; activations are never quantized (no Q8_1), mirroring the CPU
+  `vec_dot_type = F32` policy.
+- Larger batched matmuls (prompt processing, `ne11 > 8`) dequantize to exact
+  f32 and run true f32 cuBLAS GEMM; for FV5/FV5B the compute type is pinned to
+  f32 and TF32 is disabled for the call, so prefill stays in the f32 numerics
+  class too.
 - `getrows.cu` + `supports_op`: FV5/FV5B mul_mat and get_rows are claimed by
   the CUDA backend; full offload (`-ngl 99`) is supported end to end.
 
