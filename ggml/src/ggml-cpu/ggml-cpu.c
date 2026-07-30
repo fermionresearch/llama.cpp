@@ -1265,6 +1265,100 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// FV5/FV5B batched matmul (ne11 > 1): number of src0 rows dequantized per tile.
+// Per-thread scratch is GGML_FV5_TILE_ROWS * ne00 floats (sized in ggml_graph_plan,
+// which must mirror the dispatch condition in ggml_compute_forward_mul_mat).
+#define GGML_FV5_TILE_ROWS 16
+
+// Dequant-once chunk kernel for FV5/FV5B when src1 has multiple columns.
+// The generic one_chunk path calls vec_dot once per (row, column), so every
+// column re-expands the same FV5 bit-planes. Here a tile of src0 rows is
+// dequantized to f32 scratch once and then multiplied against all columns of
+// the chunk with ggml_vec_dot_f32 (SIMD). Activations stay raw f32 and the
+// accumulation is f32, so the result differs from the vec_dot path only in
+// summation order. The ne11 == 1 decode path is not affected.
+static void ggml_compute_forward_mul_mat_one_chunk_fv5(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const enum ggml_type type,
+    const int64_t ir0_start,
+    const int64_t ir0_end,
+    const int64_t ir1_start,
+    const int64_t ir1_end) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const bool src1_cont = ggml_is_contiguous(src1);
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(type)->to_float;
+
+    // broadcast factors
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+
+    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+        return;
+    }
+
+    // vec_dot_type == F32 for FV5/FV5B: src1 is consumed raw, no wdata conversion
+    assert(src1->type == GGML_TYPE_F32);
+    const size_t row_size = ggml_row_size(GGML_TYPE_F32, ne10);
+
+    assert(ne12 % ne02 == 0);
+    assert(ne13 % ne03 == 0);
+
+    // per-thread f32 scratch for one tile of dequantized src0 rows
+    const size_t wstride = GGML_FV5_TILE_ROWS*ne00 + CACHE_LINE_SIZE_F32;
+    float * const wtile = (float *) params->wdata + wstride*params->ith;
+    assert(params->wsize >= wstride*(params->ith + 1)*sizeof(float));
+
+    for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += GGML_FV5_TILE_ROWS) {
+        const int64_t ir0_tile_end = MIN(iir0 + GGML_FV5_TILE_ROWS, ir0_end);
+
+        // the dequantized tile is only valid for one (i02, i03) src0 matrix;
+        // re-dequantize when the column range spans several src0 matrices
+        int64_t cur_i02 = -1;
+        int64_t cur_i03 = -1;
+
+        for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+            const int64_t i13 = (ir1 / (ne12 * ne1));
+            const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+            const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+
+            // broadcast src0 into src1
+            const int64_t i03 = i13 / r3;
+            const int64_t i02 = i12 / r2;
+
+            if (i02 != cur_i02 || i03 != cur_i03) {
+                const char * src0_row = (const char *) src0->data + (0 + i02 * nb02 + i03 * nb03);
+                for (int64_t ir0 = iir0; ir0 < ir0_tile_end; ++ir0) {
+                    to_float(src0_row + ir0 * nb01, wtile + (ir0 - iir0) * ne00, ne00);
+                }
+                cur_i02 = i02;
+                cur_i03 = i03;
+            }
+
+            const int64_t i1 = i11;
+            const int64_t i2 = i12;
+            const int64_t i3 = i13;
+
+            // same src1 indexing as the generic one_chunk (vec_dot_type == src1->type == F32)
+            const char * src1_col = (const char *) src1->data +
+                (src1_cont
+                    ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                    : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+            float * dst_col = (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+
+            for (int64_t ir0 = iir0; ir0 < ir0_tile_end; ++ir0) {
+                ggml_vec_dot_f32(ne00, &dst_col[ir0], 0, wtile + (ir0 - iir0) * ne00, 0, (const float *) src1_col, 0, 1);
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1455,7 +1549,15 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+
+        // FV5/FV5B batched matmul: dequantize each src0 row tile once instead of
+        // re-expanding the bit-planes for every src1 column (condition mirrored by
+        // the work-size term in ggml_graph_plan); ne11 == 1 keeps the vec_dot path
+        if ((src0->type == GGML_TYPE_FV5 || src0->type == GGML_TYPE_FV5B) && ne11 > 1 && !params->use_ref) {
+            ggml_compute_forward_mul_mat_one_chunk_fv5(params, dst, src0->type, ir0_start, ir0_end, ir1_start, ir1_end);
+        } else {
+            ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        }
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -2865,6 +2967,13 @@ struct ggml_cplan ggml_graph_plan(
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                        }
+
+                        // FV5/FV5B batched path: per-thread f32 scratch for one tile of
+                        // dequantized src0 rows (must mirror the dispatch condition in
+                        // ggml_compute_forward_mul_mat)
+                        if ((node->src[0]->type == GGML_TYPE_FV5 || node->src[0]->type == GGML_TYPE_FV5B) && node->src[1]->ne[1] > 1) {
+                            cur = MAX(cur, sizeof(float)*(GGML_FV5_TILE_ROWS*node->src[0]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks);
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
