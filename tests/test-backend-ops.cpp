@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -8996,6 +8997,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, {1,  1}, {1, 1}));
         }
+    }
+
+    // Fermion FV5/FV5B: n == 1 exercises the single-token vec_dot path, n > 1 the
+    // batched dequant-once path (verify batches, prompt prefill)
+    for (ggml_type type_a : {GGML_TYPE_FV5, GGML_TYPE_FV5B}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  67, n, 256, {1, 1}, {1, 1})); // odd m (partial row tile)
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, n, 512, {1, 1}, {1, 1}));
+        }
+        // batch dims + broadcast (r2/r3 index math) and non-contiguous src1
+        for (int n : {1, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, n, 256, {3, 2}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, n, 256, {3, 2}, {2, 2}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, n, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+        }
+    }
+    // Neutrino 0.6B linear shapes at verify-batch sizes (FV5 attn/mlp, FV5B head)
+    for (int n : {2, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5,  GGML_TYPE_F32, 2048, n, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5,  GGML_TYPE_F32, 1024, n, 3072, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_FV5B, GGML_TYPE_F32, 4096, n, 1024, {1, 1}, {1, 1}));
     }
 #else
     // m = a rows

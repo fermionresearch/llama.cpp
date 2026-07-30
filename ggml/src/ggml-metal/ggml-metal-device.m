@@ -1276,6 +1276,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+            // no Metal kernels for the Fermion FV5/FV5B types: fall back to CPU
+            if (op->src[0]->type == GGML_TYPE_FV5 || op->src[0]->type == GGML_TYPE_FV5B) {
+                return false;
+            }
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:
@@ -1338,6 +1342,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
+            // no Metal kernels for the Fermion FV5/FV5B types: fall back to CPU
+            if (op->src[0]->type == GGML_TYPE_FV5 || op->src[0]->type == GGML_TYPE_FV5B) {
+                return false;
+            }
             return op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET_ROWS:
             {
