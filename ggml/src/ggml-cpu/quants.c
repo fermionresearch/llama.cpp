@@ -570,8 +570,8 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 //   w[j] = (bp[j] - bn[j]) * (br[j] ? s_hi : s_lo)
 // so the block dot factors into four masked activation sums:
 //   dot = s_lo * (sum_lo_p - sum_lo_n) + s_hi * (sum_hi_p - sum_hi_n)
-// This mirrors the sign/masked-accumulate structure of the reference NEON
-// decode (kernels/neon_war5_lab.c) in portable form.
+// This mirrors the sign/masked-accumulate structure of the format's
+// reference decode in portable form.
 
 #if defined(__AVX2__)
 static inline float ggml_fv5_hsum_ps(__m256 v) {
