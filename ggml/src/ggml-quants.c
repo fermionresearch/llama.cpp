@@ -2498,6 +2498,38 @@ void dequantize_row_fv5(const block_fv5 * GGML_RESTRICT x, float * GGML_RESTRICT
         const float s_lo = x[i].s_lo;
         const float s_hi = x[i].s_hi;
 
+#if defined(__ARM_NEON)
+        // branch-free bit-plane expansion: w = (bp - bn) * (br ? s_hi : s_lo)
+        // as a magnitude select masked by (bp | bn) with the sign bit from bn
+        static const uint32_t k_fv5_bitpos[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+        const uint32x4_t bitpos_l = vld1q_u32(k_fv5_bitpos);
+        const uint32x4_t bitpos_h = vld1q_u32(k_fv5_bitpos + 4);
+        const float32x4_t vs_lo   = vdupq_n_f32(s_lo);
+        const float32x4_t vs_hi   = vdupq_n_f32(s_hi);
+        const uint32x4_t  vsign   = vdupq_n_u32(0x80000000u);
+
+        for (int j = 0; j < QK_FV5/8; ++j) {
+            const uint32x4_t vbp = vdupq_n_u32(x[i].bp[j]);
+            const uint32x4_t vbn = vdupq_n_u32(x[i].bn[j]);
+            const uint32x4_t vbr = vdupq_n_u32(x[i].br[j]);
+
+            const uint32x4_t m_p_l = vtstq_u32(vbp, bitpos_l);
+            const uint32x4_t m_n_l = vtstq_u32(vbn, bitpos_l);
+            const uint32x4_t m_r_l = vtstq_u32(vbr, bitpos_l);
+            const uint32x4_t m_p_h = vtstq_u32(vbp, bitpos_h);
+            const uint32x4_t m_n_h = vtstq_u32(vbn, bitpos_h);
+            const uint32x4_t m_r_h = vtstq_u32(vbr, bitpos_h);
+
+            const uint32x4_t mag_l = vreinterpretq_u32_f32(vbslq_f32(m_r_l, vs_hi, vs_lo));
+            const uint32x4_t mag_h = vreinterpretq_u32_f32(vbslq_f32(m_r_h, vs_hi, vs_lo));
+
+            const uint32x4_t w_l = veorq_u32(vandq_u32(mag_l, vorrq_u32(m_p_l, m_n_l)), vandq_u32(m_n_l, vsign));
+            const uint32x4_t w_h = veorq_u32(vandq_u32(mag_h, vorrq_u32(m_p_h, m_n_h)), vandq_u32(m_n_h, vsign));
+
+            vst1q_f32(y + i*QK_FV5 + 8*j,     vreinterpretq_f32_u32(w_l));
+            vst1q_f32(y + i*QK_FV5 + 8*j + 4, vreinterpretq_f32_u32(w_h));
+        }
+#else
         for (int j = 0; j < QK_FV5; ++j) {
             const int     byte = j >> 3;
             const uint8_t bit  = 1u << (j & 7);
@@ -2505,6 +2537,7 @@ void dequantize_row_fv5(const block_fv5 * GGML_RESTRICT x, float * GGML_RESTRICT
             const float mag = (x[i].br[byte] & bit) ? s_hi : s_lo;
             y[i*QK_FV5 + j] = (float) sign * mag;
         }
+#endif
     }
 }
 

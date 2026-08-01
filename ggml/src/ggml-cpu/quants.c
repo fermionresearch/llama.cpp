@@ -630,6 +630,78 @@ void ggml_vec_dot_fv5_f32(int n, float * GGML_RESTRICT s, size_t bs, const void 
 
         sumf += s_lo * (ggml_fv5_hsum_ps(acc_lo_p) - ggml_fv5_hsum_ps(acc_lo_n))
               + s_hi * (ggml_fv5_hsum_ps(acc_hi_p) - ggml_fv5_hsum_ps(acc_hi_n));
+#elif defined(__ARM_NEON)
+        // NEON port of the AVX2 masked-accumulate path above, restructured as
+        // a branch-free table gather: each weight's 3 plane bits form an index
+        // into a per-block table of the five values {0, +/-s_lo, +/-s_hi}, the
+        // exact f32 weights are gathered bytewise with vqtbl2 and fused into
+        // four f32 accumulators; differs from the scalar path only in f32
+        // evaluation order (per-weight fma vs per-block factored sums)
+        static const uint8_t k_fv5_bitpat[16] = {
+            1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+        };
+        // replicate plane byte 2g into lanes 0..7 and byte 2g+1 into lanes 8..15
+        static const uint8_t k_fv5_selbase[16] = {
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        };
+        // replicate code byte k of a 16-weight group into 4 gather lanes
+        static const uint8_t k_fv5_rep[4][16] = {
+            {  0,  0,  0,  0,  1,  1,  1,  1,  2,  2,  2,  2,  3,  3,  3,  3 },
+            {  4,  4,  4,  4,  5,  5,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7 },
+            {  8,  8,  8,  8,  9,  9,  9,  9, 10, 10, 10, 10, 11, 11, 11, 11 },
+            { 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15 },
+        };
+        static const uint8_t k_fv5_off[16] = {
+            0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3,
+        };
+
+        // codes (pre-scaled x4 for the f32 byte gather): bp -> 4, bn -> 8, br -> 16;
+        // bp/bn are disjoint and br is a subset of bp|bn, every other index reads 0.0f
+        float lut[8] = { 0.0f, s_lo, -s_lo, 0.0f, 0.0f, s_hi, -s_hi, 0.0f };
+        uint8x16x2_t tlut;
+        tlut.val[0] = vld1q_u8((const uint8_t *) lut);
+        tlut.val[1] = vld1q_u8((const uint8_t *) lut + 16);
+
+        uint8x16x2_t tbp, tbn, tbr;
+        tbp.val[0] = vld1q_u8(x[i].bp); tbp.val[1] = vld1q_u8(x[i].bp + 16);
+        tbn.val[0] = vld1q_u8(x[i].bn); tbn.val[1] = vld1q_u8(x[i].bn + 16);
+        tbr.val[0] = vld1q_u8(x[i].br); tbr.val[1] = vld1q_u8(x[i].br + 16);
+
+        const uint8x16_t bitpat = vld1q_u8(k_fv5_bitpat);
+        const uint8x16_t rep0   = vld1q_u8(k_fv5_rep[0]);
+        const uint8x16_t rep1   = vld1q_u8(k_fv5_rep[1]);
+        const uint8x16_t rep2   = vld1q_u8(k_fv5_rep[2]);
+        const uint8x16_t rep3   = vld1q_u8(k_fv5_rep[3]);
+        const uint8x16_t off    = vld1q_u8(k_fv5_off);
+
+        uint8x16_t sel = vld1q_u8(k_fv5_selbase);
+
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+        for (int j = 0; j < QK_FV5; j += 16) {
+            const uint8x16_t mp = vtstq_u8(vqtbl2q_u8(tbp, sel), bitpat);
+            const uint8x16_t mn = vtstq_u8(vqtbl2q_u8(tbn, sel), bitpat);
+            const uint8x16_t mr = vtstq_u8(vqtbl2q_u8(tbr, sel), bitpat);
+            sel = vaddq_u8(sel, vdupq_n_u8(2));
+
+            const uint8x16_t c4 = vorrq_u8(vorrq_u8(
+                vandq_u8(mp, vdupq_n_u8(4)), vandq_u8(mn, vdupq_n_u8(8))), vandq_u8(mr, vdupq_n_u8(16)));
+
+            const float32x4_t w0 = vreinterpretq_f32_u8(vqtbl2q_u8(tlut, vaddq_u8(vqtbl1q_u8(c4, rep0), off)));
+            const float32x4_t w1 = vreinterpretq_f32_u8(vqtbl2q_u8(tlut, vaddq_u8(vqtbl1q_u8(c4, rep1), off)));
+            const float32x4_t w2 = vreinterpretq_f32_u8(vqtbl2q_u8(tlut, vaddq_u8(vqtbl1q_u8(c4, rep2), off)));
+            const float32x4_t w3 = vreinterpretq_f32_u8(vqtbl2q_u8(tlut, vaddq_u8(vqtbl1q_u8(c4, rep3), off)));
+
+            acc0 = vfmaq_f32(acc0, w0, vld1q_f32(xf + j));
+            acc1 = vfmaq_f32(acc1, w1, vld1q_f32(xf + j +  4));
+            acc2 = vfmaq_f32(acc2, w2, vld1q_f32(xf + j +  8));
+            acc3 = vfmaq_f32(acc3, w3, vld1q_f32(xf + j + 12));
+        }
+
+        sumf += vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 #else
         float sum_lo_p = 0.0f, sum_lo_n = 0.0f, sum_hi_p = 0.0f, sum_hi_n = 0.0f;
 
@@ -683,6 +755,21 @@ void ggml_vec_dot_fv5b_f32(int n, float * GGML_RESTRICT s, size_t bs, const void
             acc = _mm256_fmadd_ps(qf, _mm256_loadu_ps(xf + 8*j), acc);
         }
         sumf += x[i].s * ggml_fv5_hsum_ps(acc);
+#elif defined(__ARM_NEON)
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+        for (int j = 0; j < QK_FV5; j += 16) {
+            const int8x16_t q8  = vld1q_s8(x[i].qs + j);
+            const int16x8_t q16l = vmovl_s8(vget_low_s8 (q8));
+            const int16x8_t q16h = vmovl_s8(vget_high_s8(q8));
+            acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (q16l))), vld1q_f32(xf + j));
+            acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16l))), vld1q_f32(xf + j +  4));
+            acc2 = vfmaq_f32(acc2, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (q16h))), vld1q_f32(xf + j +  8));
+            acc3 = vfmaq_f32(acc3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16h))), vld1q_f32(xf + j + 12));
+        }
+        sumf += x[i].s * vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 #else
         float sumq = 0.0f;
         for (int j = 0; j < QK_FV5; ++j) {
